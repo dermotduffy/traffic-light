@@ -37,6 +37,10 @@
 #define DELAY_BLINK_MS            1000
 #define DELAY_SERVER_ERROR_MS     1000
 
+#define GPIO_GREEN                14
+#define GPIO_ORANGE               27
+#define GPIO_RED                  25
+
 const static char *LOG_TAG = "TrafficLightServer";
 
 static EventGroupHandle_t wifi_event_group;
@@ -73,17 +77,17 @@ void pwm_init(void) {
   };
 
   ledc_channel_config_t green_ch_conf = default_ch_conf; 
-  green_ch_conf.gpio_num = 16;
+  green_ch_conf.gpio_num = GPIO_GREEN;
   green_ch_conf.channel = LEDC_CHANNEL_0;
   ESP_ERROR_CHECK(ledc_channel_config(&green_ch_conf));
 
   ledc_channel_config_t orange_ch_conf = default_ch_conf; 
-  orange_ch_conf.gpio_num = 17;
+  orange_ch_conf.gpio_num = GPIO_ORANGE;
   orange_ch_conf.channel = LEDC_CHANNEL_1;
   ESP_ERROR_CHECK(ledc_channel_config(&orange_ch_conf));
 
   ledc_channel_config_t red_ch_conf = default_ch_conf;
-  red_ch_conf.gpio_num = 4;
+  red_ch_conf.gpio_num = GPIO_RED;
   red_ch_conf.channel = LEDC_CHANNEL_2;
   ESP_ERROR_CHECK(ledc_channel_config(&red_ch_conf));
 }
