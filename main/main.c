@@ -30,12 +30,12 @@
 #define SERVER_TCP_PORT              7000
 
 #define STATUS_TASK_NAME             "status"
-#define STATUS_TASK_STACK_WORDS      10240 // TODO: Lower this?
+#define STATUS_TASK_STACK_WORDS      2<<11
 #define STATUS_TASK_PRORITY          4
 #define STATUS_BLINKS_ON_CONNECT     3
 
 #define PULSATE_TASK_NAME            "pulsate"
-#define PULSATE_TASK_STACK_WORDS     1024
+#define PULSATE_TASK_STACK_WORDS     2<<11
 #define PULSATE_TASK_PRORITY         8
 
 #define PWM_FREQUENCY_HZ             1000
@@ -280,7 +280,7 @@ static void pulsate_task(void *p) {
   ledc_duty_direction_t direction;
   Colour colour;
 
-  ESP_LOGI(LOG_TAG, "Pulsate: Task created");
+  ESP_LOGD(LOG_TAG, "pulsate_task: Task created");
 
   while (true) {
     EventBits_t bits = xEventGroupWaitBits(
@@ -292,14 +292,13 @@ static void pulsate_task(void *p) {
         pdTRUE,     // Clear bits on return.
         pdFALSE,    // Wait for all bits.
         DELAY_WAIT_FOR_FADE_EVENT_MS / portTICK_PERIOD_MS);
-
     if (bits & PULSATE_EVENT_STOP_BIT) {
-      ESP_LOGI(LOG_TAG, "Pulsate: Asked to stop");
+      ESP_LOGD(LOG_TAG, "pulsate_task: Pulsations canceled");
       pulsing = false;
       // Whatever called this is responsible for adjusting LED.
       continue;
     } else if (bits & PULSATE_EVENT_START_BIT) {
-      ESP_LOGI(LOG_TAG, "Pulsate: Asked to start");
+      ESP_LOGD(LOG_TAG, "pulsate_task: Pulsation started");
       // Start pulsating. Copy target colours into internal buffer.
       direction = LEDC_DUTY_DIR_INCREASE;
 
@@ -319,7 +318,7 @@ static void pulsate_task(void *p) {
 
       set_fade(direction, colour);
     } else if (pulsing && (bits & sentinel_event_bit)) {
-      ESP_LOGI(LOG_TAG, "Pulsate: Sentinel event fired, reversing!");
+      ESP_LOGD(LOG_TAG, "pulsate_task: Fade completed, reversing direction");
       // The last colour fade has completed (the 'sentinel' event bit has been
       // set) => Reverse direction.
       direction = (direction == LEDC_DUTY_DIR_INCREASE ?
@@ -548,10 +547,6 @@ void app_main(void) {
   delay_task(DELAY_STARTUP_LED_ON_MS);
   set_colours(colour_all_off);
 
-  // Start helper tasks.
-  status_task_create();
-  pulsate_task_create();
-
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
@@ -569,4 +564,8 @@ void app_main(void) {
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
   ESP_ERROR_CHECK(esp_wifi_start());
+
+  // Start helper tasks.
+  status_task_create();
+  pulsate_task_create();
 }
