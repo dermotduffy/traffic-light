@@ -16,6 +16,7 @@
 #include "driver/periph_ctrl.h"
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 
 // Define these, or run make as ...
 //   EXTRA_CPPFLAGS='-DWIFI_SSID=\"SSID\" -DWIFI_PASSWORD=\"PASSWORD\"' make
@@ -26,8 +27,9 @@
 #define SERVER_TASK_NAME             "server"
 #define SERVER_TASK_STACK_WORDS      2<<13
 #define SERVER_TASK_PRORITY          6
-#define SERVER_RECV_BUF_LEN          1024
 #define SERVER_TCP_PORT              7000
+#define SERVER_COMMAND_LEN           4
+#define SERVER_RECV_BUF_LEN          SERVER_COMMAND_LEN + 1
 
 #define STATUS_TASK_NAME             "status"
 #define STATUS_TASK_STACK_WORDS      2<<11
@@ -51,6 +53,9 @@
 #define GPIO_GREEN                   14
 #define GPIO_ORANGE                  27
 #define GPIO_RED                     25
+
+#define NVS_NAMESPACE                "traffic-light"
+#define NVS_KEY                      "last-command"
 
 const static char *LOG_TAG = "TrafficLightServer";
 
@@ -76,7 +81,7 @@ static xTaskHandle status_handle;
 static xTaskHandle pulsate_handle;
 
 typedef struct {
-  char green, orange, red;
+  uint8_t green, orange, red;
 } Colour;
 
 const static Colour colour_all_off = {0,       0,    0};
@@ -168,7 +173,7 @@ static void update_duty() {
   ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2);
 }
 
-static void set_colours_raw(char green, char orange, char red) {
+static void set_colours_raw(uint8_t green, uint8_t orange, uint8_t red) {
   ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, green);
   ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, orange);
   ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2, red);
@@ -371,11 +376,96 @@ static void status_task(void *p) {
   return;
 }
 
+static bool parse_command(uint8_t recv_buf[SERVER_COMMAND_LEN]) {
+  ESP_LOGI(LOG_TAG, "parse_command: Parsing (%x, %x, %x, %x)",
+      recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]);
+
+  uint8_t command = recv_buf[0];
+  Colour target = {recv_buf[1], recv_buf[2], recv_buf[3]};
+
+  bool valid_command = true;
+
+  if (command == 'S') {        // Set
+    ESP_LOGD(LOG_TAG, "parse_command: Set colour.")
+    set_colours(target);
+  } else if (command == 'F') { // Fade
+    ESP_LOGD(LOG_TAG, "parse_command: Fade colour.")
+    set_fade(LEDC_DUTY_DIR_INCREASE, target);
+  } else if (command != 'P') {
+    valid_command = false;
+  }
+
+  if (command == 'P') {        // Pulsate.
+    ESP_LOGD(LOG_TAG, "parse_command: Pulsate colour.")
+    mutex_lock(&pulsate_colour_mutex);
+    pulsate_colour = target;
+    mutex_unlock(&pulsate_colour_mutex);
+
+    xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_START_BIT);
+  } else {
+    xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_STOP_BIT);
+  }
+  return valid_command;
+}
+
+static bool write_to_nvs(uint8_t buffer[SERVER_COMMAND_LEN]) {
+  ESP_LOGI(LOG_TAG, "write_to_nvs: Writing (%x, %x, %x, %x)",
+      buffer[0], buffer[1], buffer[2], buffer[3]);
+
+  nvs_handle handle;
+
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+    ESP_LOGE(LOG_TAG,
+             "write_to_nvs: Unable to open NVS for writing, skipping...");
+    return false;
+  }
+
+  if (nvs_set_blob(handle, NVS_KEY, buffer, SERVER_COMMAND_LEN) != ESP_OK) {
+    ESP_LOGE(LOG_TAG,
+             "write_to_nvs: Unable to write data, skipping ...");
+    nvs_close(handle);
+    return false;
+  }
+
+  if (nvs_commit(handle) != ESP_OK) {
+    ESP_LOGE(LOG_TAG,
+             "write_to_nvs: Unable to commit writes, skipping ...");
+    nvs_close(handle);
+    return false;
+  }
+
+  nvs_close(handle);
+  return true;
+}
+
+static bool read_from_nvs(uint8_t buffer[SERVER_COMMAND_LEN]) {
+  ESP_LOGI(LOG_TAG, "read_from_nvs: Reading");
+
+  nvs_handle handle;
+
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+    ESP_LOGE(LOG_TAG,
+             "read_from_nvs: Unable to open NVS for reading, skipping...");
+    return false;
+  }
+
+  size_t command_size = SERVER_COMMAND_LEN;
+  if (nvs_get_blob(handle, NVS_KEY, buffer, &command_size) != ESP_OK) {
+    ESP_LOGE(LOG_TAG,
+             "read_from_nvs: Unable to read data, skipping ...");
+    nvs_close(handle);
+    return false;
+  }
+
+  nvs_close(handle);
+  return true;
+}
+
 static void server_task(void *p) {
   int listen_socket, client_socket;
   struct sockaddr_in serv_sock_addr, client_sock_addr;
   socklen_t client_sock_addr_len = sizeof(client_sock_addr);
-  char recv_buf[SERVER_RECV_BUF_LEN];
+  uint8_t recv_buf[SERVER_RECV_BUF_LEN];
 
   while (true) {
     ESP_LOGI(LOG_TAG, "Create socket ...");
@@ -436,28 +526,13 @@ static void server_task(void *p) {
       char* ip_addr_string = inet_ntoa(client_sock_addr.sin_addr);
       ESP_LOGI(LOG_TAG, "Established connection from %s", ip_addr_string)
 
-      char bytes = recv(client_socket, recv_buf, SERVER_RECV_BUF_LEN - 1, 0);
-      if (bytes == 4) {
-        ESP_LOGI(LOG_TAG, "Received (%x, %x, %x, %x)",
-            recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]);
-        Colour target = {recv_buf[1], recv_buf[2], recv_buf[3]};
-
-        if (recv_buf[0] == 'S') {        // Set
-          set_colours(target);
-        } else if (recv_buf[0] == 'F') { // Fade
-          set_fade(LEDC_DUTY_DIR_INCREASE, target);
-        }
-
-        if (recv_buf[0] == 'P') {        // Pulsate.
-          mutex_lock(&pulsate_colour_mutex);
-          pulsate_colour = target;
-          mutex_unlock(&pulsate_colour_mutex);
-
-          xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_START_BIT);
-        } else {
-          xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_STOP_BIT);
-        }
-      } 
+      if (recv(client_socket, recv_buf, SERVER_RECV_BUF_LEN - 1, 0) ==
+          SERVER_COMMAND_LEN) {
+        parse_command(recv_buf);
+        write_to_nvs(recv_buf);
+      } else {
+        ESP_LOGI(LOG_TAG, "Receive error / malformed data from client");
+      }
       close(client_socket);
     }
 
