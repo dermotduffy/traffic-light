@@ -377,7 +377,7 @@ static void stop_pulsating() {
   while (xEventGroupWaitBits(
       pulsate_event_group, PULSATE_EVENT_STOPPED_BIT,
       pdFALSE, pdTRUE, DELAY_ARB_LONGWAIT_MS / portTICK_PERIOD_MS) == 0) {
-    ESP_LOGD(LOG_TAG, "parse_command: Waiting for pulsate task to stop");
+    ESP_LOGD(LOG_TAG, "stop_pulsating: Waiting for pulsate task to stop");
   }
 }
 
@@ -410,15 +410,15 @@ static bool parse_command(uint8_t recv_buf[SERVER_COMMAND_LEN]) {
 
   switch (command) {
     case 'S':
-      ESP_LOGD(LOG_TAG, "parse_command: Set colour.")
+      ESP_LOGI(LOG_TAG, "parse_command: Set colour.")
       set_colours(target);
       break;
     case 'F':
-      ESP_LOGD(LOG_TAG, "parse_command: Fade colour.")
+      ESP_LOGI(LOG_TAG, "parse_command: Fade colour.")
       set_fade(LEDC_DUTY_DIR_INCREASE, target);
       break;
     case 'P':
-      ESP_LOGD(LOG_TAG, "parse_command: Pulsate colour.")
+      ESP_LOGI(LOG_TAG, "parse_command: Pulsate colour.")
       {
         mutex_lock(&shared_colour_mutex);
         shared_colour = target;
@@ -427,7 +427,7 @@ static bool parse_command(uint8_t recv_buf[SERVER_COMMAND_LEN]) {
       xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_START_REQ_BIT);
       break;
     case 'B':
-      ESP_LOGD(LOG_TAG, "parse_command: Blink colour.")
+      ESP_LOGI(LOG_TAG, "parse_command: Blink colour.")
       {
         mutex_lock(&shared_colour_mutex);
         shared_colour = target;
@@ -661,12 +661,6 @@ static void server_task(void *p) {
 }
 
 static void server_task_create(void) {
-  if (server_handle) {
-    ESP_LOGI(LOG_TAG, "Server already created");
-    return;
-  }
-  ESP_LOGI(LOG_TAG, "Server created");
-
   configASSERT(xTaskCreate(server_task,
                            SERVER_TASK_NAME,
                            SERVER_TASK_STACK_WORDS,
@@ -707,17 +701,17 @@ static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 {
   switch(event->event_id) {
     case SYSTEM_EVENT_STA_START:
-      ESP_LOGI(LOG_TAG, "WIFI event: Start ...");
+      ESP_LOGD(LOG_TAG, "wifi_event_handler: WIFI start ...");
       esp_wifi_connect();
       break;
     case SYSTEM_EVENT_STA_GOT_IP:
-      ESP_LOGI(LOG_TAG, "WIFI event: Connected, got IP...");
+      ESP_LOGD(LOG_TAG, "wifi_event_handler: WIFI got IP...");
       xEventGroupSetBits(
           wifi_event_group, WIFI_EVENT_CONNECTED_BIT | WIFI_EVENT_CHANGE_BIT);
       server_task_create();
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
-      ESP_LOGI(LOG_TAG, "WIFI event: Disconnect...");
+      ESP_LOGD(LOG_TAG, "wifi_event_hanlder: Disconnected...");
       xEventGroupClearBits(
           wifi_event_group, WIFI_EVENT_CONNECTED_BIT);
       xEventGroupSetBits(
@@ -748,7 +742,7 @@ void app_main(void) {
   shared_colour_mutex = xSemaphoreCreateMutex();
   configASSERT(shared_colour_mutex != NULL);
 
-  // Light all LEDs and pause at startup (test LEDs).
+  // Light all LEDs and pause at startup (to test the LEDs).
   pwm_init();
   set_colours(colour_all_on);
   delay_task(DELAY_STARTUP_LED_ON_MS);
@@ -766,7 +760,7 @@ void app_main(void) {
     },
   };
 
-  ESP_LOGI(LOG_TAG, "Setting WiFi configuration SSID %s...",
+  ESP_LOGI(LOG_TAG, "app_main: Setting WiFi configuration SSID %s...",
       wifi_config.sta.ssid);
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
