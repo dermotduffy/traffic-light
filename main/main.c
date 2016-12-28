@@ -40,6 +40,10 @@
 #define PULSATE_TASK_STACK_WORDS     2<<11
 #define PULSATE_TASK_PRORITY         8
 
+#define BLINK_TASK_NAME              "blink"
+#define BLINK_TASK_STACK_WORDS       2<<11
+#define BLINK_TASK_PRORITY           8
+
 #define PWM_FREQUENCY_HZ             1000
 // Total desired fade length (in ticks @ pwm_frequency)
 #define FADE_DURATION_TOTAL_TICKS    2000
@@ -47,8 +51,7 @@
 #define DELAY_STARTUP_LED_ON_MS      3000
 #define DELAY_BLINK_MS               1000
 #define DELAY_SERVER_ERROR_MS        1000
-#define DELAY_WAIT_FOR_FADE_EVENT_MS 10000
-#define DELAY_WAIT_FOR_SEMAPHORE     10000
+#define DELAY_ARB_LONGWAIT_MS        10000
 
 #define GPIO_GREEN                   14
 #define GPIO_ORANGE                  27
@@ -62,23 +65,29 @@ const static char *LOG_TAG = "TrafficLightServer";
 static EventGroupHandle_t wifi_event_group;
 // Connected to wifi?
 const static int WIFI_EVENT_CONNECTED_BIT = BIT0;
+// Change to the state of the wifi connection?
+const static int WIFI_EVENT_CHANGE_BIT = BIT1;
 
 static EventGroupHandle_t pulsate_event_group;
+// Request start/stop of pulsation.
+const static int PULSATE_EVENT_START_REQ_BIT = BIT0;
+const static int PULSATE_EVENT_STOP_REQ_BIT = BIT1;
+// When the respective channel fades have ended.
+const static int PULSATE_EVENT_DUTY_DONE_GREEN_BIT = BIT2;
+const static int PULSATE_EVENT_DUTY_DONE_ORANGE_BIT = BIT3;
+const static int PULSATE_EVENT_DUTY_DONE_RED_BIT = BIT4;
+// When the pulsation has stopped.
+const static int PULSATE_EVENT_STOPPED_BIT = BIT5;
 
-// Request to start a pulsation.
-const static int PULSATE_EVENT_START_BIT = BIT0;
-// Request to stop a pulsation.
-const static int PULSATE_EVENT_STOP_BIT = BIT1;
-// Reached end of a fade within the pulsation (green).
-const static int PULSATE_EVENT_FADE_END_GREEN_BIT = BIT2;
-// Reached end of a fade within the pulsation (orange).
-const static int PULSATE_EVENT_FADE_END_ORANGE_BIT = BIT3;
-// Reached end of a fade within the pulsate (red).
-const static int PULSATE_EVENT_FADE_END_RED_BIT = BIT4;
+static EventGroupHandle_t blink_event_group;
+const static int BLINK_EVENT_START_REQ_BIT = BIT0;
+const static int BLINK_EVENT_STOP_REQ_BIT = BIT1;
+const static int BLINK_EVENT_STOPPED_BIT = BIT2;
 
 static xTaskHandle server_handle;
 static xTaskHandle status_handle;
 static xTaskHandle pulsate_handle;
+static xTaskHandle blink_handle;
 
 typedef struct {
   uint8_t green, orange, red;
@@ -89,8 +98,8 @@ const static Colour colour_all_on  = {0xff, 0xff, 0xff};
 const static Colour colour_green   = {0xff,    0,    0};
 const static Colour colour_red     = {   0,    0, 0xff};
 
-static SemaphoreHandle_t pulsate_colour_mutex;
-static Colour pulsate_colour;  // Protected by pulsate_colour_mutex.
+static SemaphoreHandle_t shared_colour_mutex;
+static Colour shared_colour;  // Protected by shared_colour_mutex.
 
 static void fade_end_interrupt() {
   // Read LEDC interrupt state.
@@ -101,19 +110,19 @@ static void fade_end_interrupt() {
   if (LEDC.int_st.duty_chng_end_hsch0) {
     xEventGroupSetBitsFromISR(
         pulsate_event_group,
-        PULSATE_EVENT_FADE_END_GREEN_BIT,
+        PULSATE_EVENT_DUTY_DONE_GREEN_BIT,
         &xHigherPriorityTaskWoken);
   }
   if (LEDC.int_st.duty_chng_end_hsch1) {
     xEventGroupSetBitsFromISR(
         pulsate_event_group,
-        PULSATE_EVENT_FADE_END_ORANGE_BIT,
+        PULSATE_EVENT_DUTY_DONE_ORANGE_BIT,
         &xHigherPriorityTaskWoken);
   }
   if (LEDC.int_st.duty_chng_end_hsch2) {
     xEventGroupSetBitsFromISR(
         pulsate_event_group,
-        PULSATE_EVENT_FADE_END_RED_BIT,
+        PULSATE_EVENT_DUTY_DONE_RED_BIT,
         &xHigherPriorityTaskWoken);
   }
 
@@ -263,7 +272,7 @@ static void delay_task(int ms) {
 static void mutex_lock(SemaphoreHandle_t* mutex) {
   while (xSemaphoreTake(
       *mutex,
-      DELAY_WAIT_FOR_SEMAPHORE / portTICK_PERIOD_MS) == pdFALSE) {
+      DELAY_ARB_LONGWAIT_MS / portTICK_PERIOD_MS) == pdFALSE) {
   }
 }
 
@@ -290,36 +299,55 @@ static void pulsate_task(void *p) {
   while (true) {
     EventBits_t bits = xEventGroupWaitBits(
         pulsate_event_group,
-        PULSATE_EVENT_START_BIT | PULSATE_EVENT_STOP_BIT |
-            PULSATE_EVENT_FADE_END_GREEN_BIT |
-            PULSATE_EVENT_FADE_END_ORANGE_BIT |
-            PULSATE_EVENT_FADE_END_RED_BIT,
+        PULSATE_EVENT_START_REQ_BIT | PULSATE_EVENT_STOP_REQ_BIT |
+            PULSATE_EVENT_DUTY_DONE_GREEN_BIT |
+            PULSATE_EVENT_DUTY_DONE_ORANGE_BIT |
+            PULSATE_EVENT_DUTY_DONE_RED_BIT,
         pdTRUE,     // Clear bits on return.
         pdFALSE,    // Wait for all bits.
-        DELAY_WAIT_FOR_FADE_EVENT_MS / portTICK_PERIOD_MS);
-    if (bits & PULSATE_EVENT_STOP_BIT) {
-      ESP_LOGD(LOG_TAG, "pulsate_task: Pulsations canceled");
+        DELAY_ARB_LONGWAIT_MS / portTICK_PERIOD_MS);
+
+    if (bits & PULSATE_EVENT_STOP_REQ_BIT) {
+      ESP_LOGD(LOG_TAG, "pulsate_task: Pulsation stop requested");
       pulsing = false;
-      // Whatever called this is responsible for adjusting LED.
+      xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_STOPPED_BIT);
       continue;
-    } else if (bits & PULSATE_EVENT_START_BIT) {
-      ESP_LOGD(LOG_TAG, "pulsate_task: Pulsation started");
-      // Start pulsating. Copy target colours into internal buffer.
+    } else if (bits & PULSATE_EVENT_START_REQ_BIT) {
+      ESP_LOGD(LOG_TAG, "pulsate_task: Pulsation start requested");
+
+      xEventGroupClearBits(pulsate_event_group, PULSATE_EVENT_STOPPED_BIT);
+      pulsing = true;
       direction = LEDC_DUTY_DIR_INCREASE;
 
-      mutex_lock(&pulsate_colour_mutex);
-      colour = pulsate_colour;
-      mutex_unlock(&pulsate_colour_mutex);
-
-      pulsing = true;
-
-      if (colour.green >= colour.orange && colour.green >= colour.red) {
-        sentinel_event_bit = PULSATE_EVENT_FADE_END_GREEN_BIT;
-      } else if (colour.orange >= colour.red) {
-        sentinel_event_bit = PULSATE_EVENT_FADE_END_ORANGE_BIT;
-      } else {
-        sentinel_event_bit = PULSATE_EVENT_FADE_END_RED_BIT;
+      {
+        // Copy target colours into internal buffer.
+        mutex_lock(&shared_colour_mutex);
+        colour = shared_colour;
+        mutex_unlock(&shared_colour_mutex);
       }
+
+      // Work out which colour has the further 'distance' to fade, that
+      // will mark the point at which the pulsate is reversed. See comment
+      // at top of file.
+      if (colour.green >= colour.orange && colour.green >= colour.red) {
+        sentinel_event_bit = PULSATE_EVENT_DUTY_DONE_GREEN_BIT;
+      } else if (colour.orange >= colour.red) {
+        sentinel_event_bit = PULSATE_EVENT_DUTY_DONE_ORANGE_BIT;
+      } else {
+        sentinel_event_bit = PULSATE_EVENT_DUTY_DONE_RED_BIT;
+      }
+
+      // Set everything to off to avoid transition artefacts.
+      set_colours(colour_all_off);
+
+      // Wait for all duty updates to be completed.
+      xEventGroupWaitBits(pulsate_event_group,
+          PULSATE_EVENT_DUTY_DONE_GREEN_BIT |
+              PULSATE_EVENT_DUTY_DONE_ORANGE_BIT |
+              PULSATE_EVENT_DUTY_DONE_RED_BIT,
+          pdTRUE,   // Clear bits on return.
+          pdTRUE,   // Wait for all bits.
+          DELAY_ARB_LONGWAIT_MS / portTICK_PERIOD_MS);
 
       set_fade(direction, colour);
     } else if (pulsing && (bits & sentinel_event_bit)) {
@@ -333,79 +361,81 @@ static void pulsate_task(void *p) {
   }
 }
 
-static void status_task(void *p) {
-  // Counter of number of connection-established blinks remaining.
-  //  -1: Not connected.
-  //   0: Already blinked connection success.
-  // 1-3: Number of blinks remaining.
-  int connected_blinks_remaining = -1;
-
-  while (true) {
-    // Is wifi connected?
-    if (xEventGroupGetBits(wifi_event_group) & WIFI_EVENT_CONNECTED_BIT) {
-      // Already blinked that we are connected?
-      if (connected_blinks_remaining == 0) {
-        delay_task(DELAY_BLINK_MS);
-      } else {
-        // Need to do blinks to show connection. If the connection
-        // has just been established, set the blink counter to the
-        // desired number of blinks.
-        if (connected_blinks_remaining < 0) {
-          connected_blinks_remaining = STATUS_BLINKS_ON_CONNECT;
-        }
-        set_colours(colour_green);
-        delay_task(DELAY_BLINK_MS);
-        set_colours(colour_all_off);
-        delay_task(DELAY_BLINK_MS);
-      
-        --connected_blinks_remaining;
-      }
-    } else {
-      set_colours(colour_red);
-      delay_task(DELAY_BLINK_MS);
-      set_colours(colour_all_off);
-      delay_task(DELAY_BLINK_MS);
-
-      // Reset blink counter so that blinks occur
-      // on connection (re-)establishment.
-      connected_blinks_remaining = -1;
-    }
+static void stop_blinking() {
+  xEventGroupSetBits(blink_event_group, BLINK_EVENT_STOP_REQ_BIT);
+  while (xEventGroupWaitBits(
+      blink_event_group, BLINK_EVENT_STOPPED_BIT,
+      pdFALSE, pdTRUE, DELAY_ARB_LONGWAIT_MS / portTICK_PERIOD_MS) == 0) {
+    ESP_LOGD(LOG_TAG, "stop_blinking: Waiting for blink task to stop");
   }
+}
 
-  vTaskDelete(NULL);
-  return;
+static void stop_pulsating() {
+  xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_STOP_REQ_BIT);
+  while (xEventGroupWaitBits(
+      pulsate_event_group, PULSATE_EVENT_STOPPED_BIT,
+      pdFALSE, pdTRUE, DELAY_ARB_LONGWAIT_MS / portTICK_PERIOD_MS) == 0) {
+    ESP_LOGD(LOG_TAG, "parse_command: Waiting for pulsate task to stop");
+  }
 }
 
 static bool parse_command(uint8_t recv_buf[SERVER_COMMAND_LEN]) {
-  ESP_LOGI(LOG_TAG, "parse_command: Parsing (%x, %x, %x, %x)",
+  ESP_LOGI(LOG_TAG, "parse_command: Parsing (0x%x, 0x%x, 0x%x, 0x%x)",
       recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]);
 
   uint8_t command = recv_buf[0];
   Colour target = {recv_buf[1], recv_buf[2], recv_buf[3]};
 
-  bool valid_command = true;
-
-  if (command == 'S') {        // Set
-    ESP_LOGD(LOG_TAG, "parse_command: Set colour.")
-    set_colours(target);
-  } else if (command == 'F') { // Fade
-    ESP_LOGD(LOG_TAG, "parse_command: Fade colour.")
-    set_fade(LEDC_DUTY_DIR_INCREASE, target);
-  } else if (command != 'P') {
-    valid_command = false;
+  switch (command) {
+    case 'S':   // Set.
+    case 'F':   // Fade.
+    case 'P':   // Pulsate.
+    case 'B':   // Blink.
+      break;
+    default:
+      return false;
   }
 
-  if (command == 'P') {        // Pulsate.
-    ESP_LOGD(LOG_TAG, "parse_command: Pulsate colour.")
-    mutex_lock(&pulsate_colour_mutex);
-    pulsate_colour = target;
-    mutex_unlock(&pulsate_colour_mutex);
-
-    xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_START_BIT);
-  } else {
-    xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_STOP_BIT);
+  // Request a stop of helper tasks (pulsate + blink) that might be working on
+  // the LEDs.
+  if (command == 'S' || command == 'F' || command == 'P') {
+    stop_blinking();
   }
-  return valid_command;
+
+  if (command == 'S' || command == 'F' || command == 'B') {
+    stop_pulsating();
+  }
+
+  switch (command) {
+    case 'S':
+      ESP_LOGD(LOG_TAG, "parse_command: Set colour.")
+      set_colours(target);
+      break;
+    case 'F':
+      ESP_LOGD(LOG_TAG, "parse_command: Fade colour.")
+      set_fade(LEDC_DUTY_DIR_INCREASE, target);
+      break;
+    case 'P':
+      ESP_LOGD(LOG_TAG, "parse_command: Pulsate colour.")
+      {
+        mutex_lock(&shared_colour_mutex);
+        shared_colour = target;
+        mutex_unlock(&shared_colour_mutex);
+      }
+      xEventGroupSetBits(pulsate_event_group, PULSATE_EVENT_START_REQ_BIT);
+      break;
+    case 'B':
+      ESP_LOGD(LOG_TAG, "parse_command: Blink colour.")
+      {
+        mutex_lock(&shared_colour_mutex);
+        shared_colour = target;
+        mutex_unlock(&shared_colour_mutex);
+      }
+      xEventGroupSetBits(blink_event_group, BLINK_EVENT_START_REQ_BIT);
+      break;
+  }
+
+  return true;
 }
 
 static bool write_to_nvs(uint8_t buffer[SERVER_COMMAND_LEN]) {
@@ -459,6 +489,106 @@ static bool read_from_nvs(uint8_t buffer[SERVER_COMMAND_LEN]) {
 
   nvs_close(handle);
   return true;
+}
+
+static void blink_task(void* p) {
+  // Is the blink task actively blinking?
+  bool blinking_active = false;
+
+  // Are the lights lit, or is this an off cycle?
+  bool blink_lit_now = false;
+
+  Colour colour;
+  int wait_time_ms = DELAY_BLINK_MS;
+
+  while (true) {
+    // This wait serves both as the wait for a blink start,
+    // but also the timer between blinks -- the wait_time_ms is
+    // altered to do so.
+    EventBits_t bits = xEventGroupWaitBits(
+        blink_event_group,
+        BLINK_EVENT_START_REQ_BIT | BLINK_EVENT_STOP_REQ_BIT,
+        pdTRUE,   // Clear on exit.
+        pdFALSE,  // Wait for all.
+        wait_time_ms / portTICK_PERIOD_MS);
+
+    if (bits & BLINK_EVENT_STOP_REQ_BIT) {
+      ESP_LOGD(LOG_TAG, "blink_task: Blink stop requested");
+      blinking_active = false;
+      wait_time_ms = DELAY_ARB_LONGWAIT_MS;
+      xEventGroupSetBits(blink_event_group, BLINK_EVENT_STOPPED_BIT);
+      continue;
+    } else if (bits & BLINK_EVENT_START_REQ_BIT) {
+      ESP_LOGD(LOG_TAG, "blink_task: Blink start requested");
+      xEventGroupClearBits(blink_event_group, BLINK_EVENT_STOPPED_BIT);
+      blinking_active = true;
+      wait_time_ms = DELAY_BLINK_MS;
+
+      {
+        mutex_lock(&shared_colour_mutex);
+        colour = shared_colour;
+        mutex_unlock(&shared_colour_mutex);
+      }
+
+      blink_lit_now = true;
+      ESP_LOGD(LOG_TAG, "blink_task: First blink (%i, %i, %i) -> on!",
+          colour.green, colour.orange, colour.red);
+      set_colours(colour);
+    } else if (blinking_active) {
+      if (blink_lit_now) {
+        ESP_LOGD(LOG_TAG, "blink_task: Blink (%i, %i, %i) -> on!",
+            colour.green, colour.orange, colour.red);
+        set_colours(colour_all_off);
+      } else {
+        ESP_LOGD(LOG_TAG, "blink_task: Blink off!");
+        set_colours(colour);
+      }
+      blink_lit_now = !blink_lit_now;
+    }
+  }
+}
+
+static void status_task(void *p) {
+  uint8_t buffer[SERVER_COMMAND_LEN];
+  bool acted_on_disconnect = false, acted_on_connect = false;
+
+  while (true) {
+    EventBits_t bits = xEventGroupGetBits(wifi_event_group);
+
+    if (!acted_on_connect && (bits & WIFI_EVENT_CONNECTED_BIT)) {
+      acted_on_connect = true;
+      acted_on_disconnect = false;
+      ESP_LOGI(LOG_TAG,
+               "status_task: Wifi available, restoring state if any");
+
+      xEventGroupSetBits(blink_event_group, BLINK_EVENT_STOP_REQ_BIT);
+      stop_blinking();
+      if (read_from_nvs(buffer) && !parse_command(buffer)) {
+        set_colours(colour_all_off);
+      }
+    } else if (!acted_on_disconnect &&
+        ((bits & WIFI_EVENT_CONNECTED_BIT) == 0)) {
+      stop_pulsating();
+
+      acted_on_disconnect = true;
+      acted_on_connect = false;
+      {
+        mutex_lock(&shared_colour_mutex);
+        shared_colour = colour_red;
+        mutex_unlock(&shared_colour_mutex);
+      }
+      xEventGroupSetBits(blink_event_group, BLINK_EVENT_START_REQ_BIT);
+    }
+    xEventGroupWaitBits(wifi_event_group,
+        WIFI_EVENT_CHANGE_BIT,
+        pdTRUE,
+        pdTRUE,
+        DELAY_ARB_LONGWAIT_MS / portTICK_PERIOD_MS);
+  }
+
+  // Never reached.
+  vTaskDelete(NULL);
+  return;
 }
 
 static void server_task(void *p) {
@@ -577,6 +707,16 @@ static void pulsate_task_create(void) {
                            &pulsate_handle) == pdTRUE);
 }
 
+static void blink_task_create(void) {
+  configASSERT(xTaskCreate(blink_task,
+                           BLINK_TASK_NAME,
+                           BLINK_TASK_STACK_WORDS,
+                           NULL,
+                           BLINK_TASK_PRORITY,
+                           &blink_handle) == pdTRUE);
+}
+
+
 static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 {
   switch(event->event_id) {
@@ -586,12 +726,16 @@ static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
       break;
     case SYSTEM_EVENT_STA_GOT_IP:
       ESP_LOGI(LOG_TAG, "WIFI event: Connected, got IP...");
-      xEventGroupSetBits(wifi_event_group, WIFI_EVENT_CONNECTED_BIT);
+      xEventGroupSetBits(
+          wifi_event_group, WIFI_EVENT_CONNECTED_BIT | WIFI_EVENT_CHANGE_BIT);
       server_task_create();
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
       ESP_LOGI(LOG_TAG, "WIFI event: Disconnect...");
-      xEventGroupClearBits(wifi_event_group, WIFI_EVENT_CONNECTED_BIT);
+      xEventGroupClearBits(
+          wifi_event_group, WIFI_EVENT_CONNECTED_BIT);
+      xEventGroupSetBits(
+          wifi_event_group, WIFI_EVENT_CHANGE_BIT);
 
       /* This is a workaround as ESP32 WiFi libs don't currently
          auto-reassociate. */
@@ -613,8 +757,10 @@ void app_main(void) {
 
   pulsate_event_group = xEventGroupCreate();
   configASSERT(pulsate_event_group != NULL);
-  pulsate_colour_mutex = xSemaphoreCreateMutex();
-  configASSERT(pulsate_colour_mutex != NULL);
+  blink_event_group = xEventGroupCreate();
+  configASSERT(blink_event_group != NULL);
+  shared_colour_mutex = xSemaphoreCreateMutex();
+  configASSERT(shared_colour_mutex != NULL);
 
   // Light all LEDs and pause at startup (test LEDs).
   pwm_init();
@@ -641,6 +787,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(esp_wifi_start());
 
   // Start helper tasks.
+  blink_task_create();
   status_task_create();
   pulsate_task_create();
 }
