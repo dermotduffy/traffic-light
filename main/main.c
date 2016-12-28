@@ -26,10 +26,12 @@
 
 #define SERVER_TASK_NAME             "server"
 #define SERVER_TASK_STACK_WORDS      2<<13
-#define SERVER_TASK_PRORITY          6
-#define SERVER_TCP_PORT              7000
+#define SERVER_TASK_PRORITY          8
+#define SERVER_UDP_PORT              7000
 #define SERVER_COMMAND_LEN           4
 #define SERVER_RECV_BUF_LEN          SERVER_COMMAND_LEN + 1
+#define SERVER_RECV_TIMEOUT_SECS     10
+#define SERVER_ERROR_BUFFER_LEN      80
 
 #define STATUS_TASK_NAME             "status"
 #define STATUS_TASK_STACK_WORDS      2<<11
@@ -38,11 +40,11 @@
 
 #define PULSATE_TASK_NAME            "pulsate"
 #define PULSATE_TASK_STACK_WORDS     2<<11
-#define PULSATE_TASK_PRORITY         8
+#define PULSATE_TASK_PRORITY         6
 
 #define BLINK_TASK_NAME              "blink"
 #define BLINK_TASK_STACK_WORDS       2<<11
-#define BLINK_TASK_PRORITY           8
+#define BLINK_TASK_PRORITY           6
 
 #define PWM_FREQUENCY_HZ             1000
 // Total desired fade length (in ticks @ pwm_frequency)
@@ -592,49 +594,32 @@ static void status_task(void *p) {
 }
 
 static void server_task(void *p) {
-  int listen_socket, client_socket;
-  struct sockaddr_in serv_sock_addr, client_sock_addr;
-  socklen_t client_sock_addr_len = sizeof(client_sock_addr);
+  int server_socket;
+  struct sockaddr_in serv_sock_addr, client_addr;
+  socklen_t client_addr_len = sizeof(client_addr);
   uint8_t recv_buf[SERVER_RECV_BUF_LEN];
+  char error_buffer[SERVER_ERROR_BUFFER_LEN];
 
   while (true) {
-    ESP_LOGI(LOG_TAG, "Create socket ...");
-    listen_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_socket < 0) {
-      ESP_LOGW(LOG_TAG, "socket(...) failed");
+    ESP_LOGD(LOG_TAG, "server_task: Create socket ...");
+    server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (server_socket < 0) {
+      ESP_LOGW(LOG_TAG, "server_task: socket(...) failed");
       delay_task(DELAY_SERVER_ERROR_MS);
       continue;
     }
 
-    int reuse = 1;
-    if (setsockopt(listen_socket,
-                   SOL_SOCKET,
-                   SO_REUSEADDR,
-                   &reuse, sizeof(reuse)) < 0) {
-      delay_task(DELAY_SERVER_ERROR_MS);
-      continue;
-    }
-
-    ESP_LOGI(LOG_TAG, "Bind ...");
+    ESP_LOGD(LOG_TAG, "server_task: Bind ...");
     memset(&serv_sock_addr, 0, sizeof(serv_sock_addr));
     serv_sock_addr.sin_family = AF_INET;
-    serv_sock_addr.sin_addr.s_addr = 0;
-    serv_sock_addr.sin_port = htons(SERVER_TCP_PORT);
+    serv_sock_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_sock_addr.sin_port = htons(SERVER_UDP_PORT);
   
-    if (bind(listen_socket,
+    if (bind(server_socket,
              (struct sockaddr*)&serv_sock_addr,
              sizeof(serv_sock_addr))) {
-      ESP_LOGW(LOG_TAG, "bind(...) failed");
-      close(listen_socket);
-
-      delay_task(DELAY_SERVER_ERROR_MS);
-      continue;
-    }
-
-    ESP_LOGI(LOG_TAG, "Listen ...");
-    if (listen(listen_socket, 32)) {
-      ESP_LOGW(LOG_TAG, "listen(...) failed");
-      close(listen_socket); 
+      ESP_LOGW(LOG_TAG, "server_task: bind(...) failed");
+      close(server_socket);
 
       delay_task(DELAY_SERVER_ERROR_MS);
       continue;
@@ -642,31 +627,32 @@ static void server_task(void *p) {
 
     memset(recv_buf, 0, SERVER_RECV_BUF_LEN);
     while (true) {
-      client_socket = accept(
-          listen_socket,
-          (struct sockaddr*)&client_sock_addr,
-          &client_sock_addr_len);
+      ssize_t bytes = recvfrom(
+          server_socket,
+          recv_buf,
+          SERVER_RECV_BUF_LEN-1,
+          0,
+          (struct sockaddr *)&client_addr,
+          &client_addr_len);
 
-      if (client_socket < 0) {
-        ESP_LOGW(LOG_TAG, "accept(...) failed");
-        delay_task(DELAY_SERVER_ERROR_MS);
-        break;
-      }
+      char* ip_addr_string = inet_ntoa(client_addr.sin_addr);
+      ESP_LOGI(LOG_TAG, "server_task: Received data from %s", ip_addr_string)
 
-      char* ip_addr_string = inet_ntoa(client_sock_addr.sin_addr);
-      ESP_LOGI(LOG_TAG, "Established connection from %s", ip_addr_string)
-
-      if (recv(client_socket, recv_buf, SERVER_RECV_BUF_LEN - 1, 0) ==
-          SERVER_COMMAND_LEN) {
+      if (bytes == SERVER_COMMAND_LEN) {
         parse_command(recv_buf);
         write_to_nvs(recv_buf);
+      } else if (bytes < 0) {
+        strerror_r(errno, error_buffer, SERVER_ERROR_BUFFER_LEN);
+        ESP_LOGW(LOG_TAG, "server_task: recvfrom error (%i): %s",
+            bytes, error_buffer);
       } else {
-        ESP_LOGI(LOG_TAG, "Receive error / malformed data from client");
+        ESP_LOGI(LOG_TAG,
+            "server_task: recvfrom received %i bytes, expected %i",
+            bytes, SERVER_COMMAND_LEN);
       }
-      close(client_socket);
     }
 
-    close(listen_socket);
+    close(server_socket);
   }
 
   // Never reached.
